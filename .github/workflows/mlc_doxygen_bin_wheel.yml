@@ -114,7 +114,10 @@ jobs:
           if-no-files-found: error
 
   build_sdist:
-    name: Source distribution
+    # The sdist is built only to check packaging. It is not published:
+    # these packages ship prebuilt binaries, and a PyPI sdist would make pip
+    # attempt a long native source build on platforms without a wheel.
+    name: Source distribution check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -132,15 +135,9 @@ jobs:
       - name: Build sdist
         working-directory: packages/mlc-doxygen-bin
         run: pipx run build --sdist
-      - name: Upload sdist artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: mlc-doxygen-bin-sdist
-          path: packages/mlc-doxygen-bin/dist/*.tar.gz
-          if-no-files-found: error
 
   publish:
-    name: Publish distributions
+    name: Publish wheels
     needs: [build_wheels, build_sdist]
     if: ${{ inputs.publish }}
     runs-on: ubuntu-latest
@@ -152,7 +149,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          pattern: mlc-doxygen-bin-*
+          pattern: mlc-doxygen-bin-wheel-*
           path: dist
           merge-multiple: true
       - name: List distributions
