@@ -34,8 +34,3 @@ packages/<pkg>/
 
 Helpers are copied per package rather than shared so each package builds from
 its own sdist.
-
-`mlc-llvm-static` keeps this layout with its own build scripts instead of
-cibuildwheel. Its wheel-only `mlc-llvm-static-extra-targets` add-on lives in
-`packages/mlc-llvm-static/extra-targets/` and reads the parent `version.py`, so
-both distributions share one version.
