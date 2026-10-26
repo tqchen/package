@@ -85,7 +85,7 @@ index 7e9bd0f..77eceb4 100644
      return;
 diff --git a/llvm/lib/ExecutionEngine/JITLink/COFF_aarch64.cpp b/llvm/lib/ExecutionEngine/JITLink/COFF_aarch64.cpp
 new file mode 100644
-index 0000000..7f2441c
+index 0000000..a987dbc
 --- /dev/null
 +++ b/llvm/lib/ExecutionEngine/JITLink/COFF_aarch64.cpp
 @@ -0,0 +1,347 @@
@@ -216,7 +216,7 @@ index 0000000..7f2441c
 +      if ((Instr & 0x7f000000) != 0x11000000)
 +        return make_error<JITLinkError>("Invalid ADD relocation instruction");
 +      K = R.getType() == COFF::IMAGE_REL_ARM64_PAGEOFFSET_12A
-+              ? aarch64::PageOffset12
++              ? Edge::Kind(aarch64::PageOffset12)
 +          : R.getType() == COFF::IMAGE_REL_ARM64_SECREL_LOW12A ? SecRelLow12A
 +                                                               : SecRelHigh12A;
 +      A = (Instr >> 10) & 0xfff;
@@ -228,7 +228,7 @@ index 0000000..7f2441c
 +        return make_error<JITLinkError>(
 +            "Invalid load/store relocation instruction");
 +      K = R.getType() == COFF::IMAGE_REL_ARM64_PAGEOFFSET_12L
-+              ? aarch64::PageOffset12
++              ? Edge::Kind(aarch64::PageOffset12)
 +              : SecRelLow12L;
 +      A = ((Instr >> 10) & 0xfff) << aarch64::getPageOffset12Shift(Instr);
 +      ClearMask = 0x003ffc00;
@@ -436,12 +436,82 @@ index 0000000..7f2441c
 +  COFFJITLinker_aarch64::link(std::move(Ctx), std::move(G), std::move(Config));
 +}
 +} // namespace llvm::jitlink
+diff --git a/llvm/test/ExecutionEngine/JITLink/AArch64/COFF_branch_range.s b/llvm/test/ExecutionEngine/JITLink/AArch64/COFF_branch_range.s
+new file mode 100644
+index 0000000..ad63e98
+--- /dev/null
++++ b/llvm/test/ExecutionEngine/JITLink/AArch64/COFF_branch_range.s
+@@ -0,0 +1,9 @@
++# RUN: llvm-mc -triple=aarch64-pc-windows-msvc -filetype=obj -o %t.o %s
++# RUN: not llvm-jitlink -noexec -slab-allocate 100Kb -slab-address 0x10000000 -slab-page-size 4096 -abs distant=0x7000000000 %t.o 2>&1 | FileCheck %s
++# CHECK: out of range
++# Conditional branches are not extended by the external B/BL thunk pass.
++.text
++.globl main
++main:
++  b.eq distant
++  ret
+diff --git a/llvm/test/ExecutionEngine/JITLink/AArch64/COFF_negative_addends.test b/llvm/test/ExecutionEngine/JITLink/AArch64/COFF_negative_addends.test
+new file mode 100644
+index 0000000..232767d
+--- /dev/null
++++ b/llvm/test/ExecutionEngine/JITLink/AArch64/COFF_negative_addends.test
+@@ -0,0 +1,49 @@
++# RUN: yaml2obj %s -o %t.o
++# RUN: llvm-jitlink -noexec -slab-allocate 100Kb -slab-address 0x10000000 -slab-page-size 4096 -abs __ImageBase=0x10000000 -check %s %t.o
++# jitlink-check: *{4}(secrel) = 4
++# jitlink-check: *{4}(rva) = target-__ImageBase-4
++--- !COFF
++header:
++  Machine: IMAGE_FILE_MACHINE_ARM64
++  Characteristics: []
++sections:
++  - Name: .text
++    Characteristics: [IMAGE_SCN_CNT_CODE, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ]
++    Alignment: 4
++    SectionData: 'C0035FD6'
++  - Name: .data
++    Characteristics: [IMAGE_SCN_CNT_INITIALIZED_DATA, IMAGE_SCN_MEM_READ, IMAGE_SCN_MEM_WRITE]
++    Alignment: 8
++    SectionData: 'FCFFFFFFFCFFFFFF0000000000000000'
++    Relocations:
++      - VirtualAddress: 0
++        SymbolName: target
++        Type: IMAGE_REL_ARM64_SECREL
++      - VirtualAddress: 4
++        SymbolName: target
++        Type: IMAGE_REL_ARM64_ADDR32NB
++symbols:
++  - Name: main
++    Value: 0
++    SectionNumber: 1
++    SimpleType: IMAGE_SYM_TYPE_NULL
++    ComplexType: IMAGE_SYM_DTYPE_FUNCTION
++    StorageClass: IMAGE_SYM_CLASS_EXTERNAL
++  - Name: target
++    Value: 8
++    SectionNumber: 2
++    SimpleType: IMAGE_SYM_TYPE_NULL
++    ComplexType: IMAGE_SYM_DTYPE_NULL
++    StorageClass: IMAGE_SYM_CLASS_EXTERNAL
++  - Name: secrel
++    Value: 0
++    SectionNumber: 2
++    SimpleType: IMAGE_SYM_TYPE_NULL
++    ComplexType: IMAGE_SYM_DTYPE_NULL
++    StorageClass: IMAGE_SYM_CLASS_EXTERNAL
++  - Name: rva
++    Value: 4
++    SectionNumber: 2
++    SimpleType: IMAGE_SYM_TYPE_NULL
++    ComplexType: IMAGE_SYM_DTYPE_NULL
++    StorageClass: IMAGE_SYM_CLASS_EXTERNAL
 diff --git a/llvm/test/ExecutionEngine/JITLink/AArch64/COFF_relocations.s b/llvm/test/ExecutionEngine/JITLink/AArch64/COFF_relocations.s
 new file mode 100644
-index 0000000..43e3ed4
+index 0000000..5528eca
 --- /dev/null
 +++ b/llvm/test/ExecutionEngine/JITLink/AArch64/COFF_relocations.s
-@@ -0,0 +1,66 @@
+@@ -0,0 +1,95 @@
 +# RUN: rm -rf %t && mkdir -p %t
 +# RUN: llvm-mc -triple=aarch64-pc-windows-msvc -filetype=obj -o %t/coff_reloc.o %s
 +# RUN: llvm-jitlink -noexec -slab-allocate 100Kb -slab-address 0x10000000 \
@@ -487,10 +557,35 @@ index 0000000..43e3ed4
 +# jitlink-check: *{8}(__imp_external_data) = external_data
 +# jitlink-check: decode_operand(import_load, 2) = __imp_external_data[11:3]
 +
++        .globl sec_low, sec_high, sec_load, cond_branch, test_branch, plain_branch
++sec_low:
++        add x0, x0, :secrel_lo12:data+8
++sec_high:
++        add x1, x1, :secrel_hi12:data+4096
++sec_load:
++        ldr x2, [x2, :secrel_lo12:data+8]
++cond_branch:
++        b.eq other
++ test_branch:
++        tbz x0, #0, other
++plain_branch:
++        bl other
++# jitlink-check: decode_operand(sec_low, 2) = 24
++# jitlink-check: decode_operand(sec_high, 2) = 1
++# jitlink-check: decode_operand(sec_load, 2) = 3
++# jitlink-check: decode_operand(cond_branch, 1)[18:0] = (other-cond_branch)[20:2]
++# jitlink-check: decode_operand(test_branch, 2)[13:0] = (other-test_branch)[15:2]
++# jitlink-check: decode_operand(plain_branch, 0)[25:0] = (other-plain_branch)[27:2]
++
++        .section .text$other,"xr"
++        .globl other
++other:
++        ret
++
 +        .data
 +        .p2align 4
 +        .quad 0, 0
-+        .globl data, ptr64, ptr32, rva, secrel, secidx
++        .globl data, ptr64, ptr32, rva, secrel, secidx, rel32
 + data:
 +        .quad 42, 43
 +ptr64:
@@ -503,8 +598,12 @@ index 0000000..43e3ed4
 +        .secrel32 data
 +secidx:
 +        .secidx data
++        .p2align 2
++rel32:
++        .long other-rel32-4
 +# jitlink-check: *{8}(ptr64) = data-8
 +# jitlink-check: *{4}(ptr32) = external_data-4
 +# jitlink-check: *{4}(rva) = data-__ImageBase-4
 +# jitlink-check: *{4}(secrel) = 16
 +# jitlink-check: *{2}(secidx) = 2
++# jitlink-check: *{4}(rel32) = (other-rel32-4)[31:0]
