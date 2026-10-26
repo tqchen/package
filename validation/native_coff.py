@@ -27,7 +27,7 @@ run("cmake", "-S", source / "llvm", "-B", build, "-G", "Ninja",
     "-DLLVM_USE_CRT_RELEASE=MD", "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL",
     "-DLLVM_ENABLE_ZLIB=OFF", "-DLLVM_ENABLE_ZSTD=OFF", "-DLLVM_ENABLE_LIBXML2=OFF",
     "-DLLVM_ENABLE_LIBEDIT=OFF", "-DLLVM_ENABLE_Z3_SOLVER=OFF", "-DLLVM_ENABLE_DIA_SDK=OFF")
-run("cmake", "--build", build, "--target", "LLVMJITLink", "llvm-jitlink", "llvm-mc", "--parallel", "8")
+run("cmake", "--build", build, "--target", "LLVMJITLink", "llvm-jitlink", "llvm-mc", "yaml2obj", "--parallel", "8")
 sdk = Path(subprocess.check_output([sys.executable, "-m", "mlc_llvm_static.config", "--prefix"], text=True).strip())
 archive = sdk / "lib/LLVMJITLink.lib"
 original = hashlib.sha256(archive.read_bytes()).hexdigest()
@@ -41,6 +41,11 @@ run(build / "bin/llvm-mc.exe", "-triple=aarch64-pc-windows-msvc", "-filetype=obj
 run(build / "bin/llvm-jitlink.exe", "-noexec", "-slab-allocate", "100Kb", "-slab-address", "0x10000000",
     "-slab-page-size", "4096", "-abs", "__ImageBase=0x10000000", "-abs", "external_func=0x7000000000",
     "-abs", "external_data=0x12345008", "-check", fixture, obj)
+negative = fixture.with_name("COFF_negative_addends.test")
+negative_obj = work / "negative.o"
+run(build / "bin/yaml2obj.exe", negative, "-o", negative_obj)
+run(build / "bin/llvm-jitlink.exe", "-noexec", "-slab-allocate", "100Kb", "-slab-address", "0x10000000",
+    "-slab-page-size", "4096", "-abs", "__ImageBase=0x10000000", "-check", negative, negative_obj)
 evidence = {"llvm_version": prepare_llvm.LLVM_VERSION, "source_sha256": prepare_llvm.SOURCES["llvm"]["sha256"],
             "patches": prepare_llvm.patch_identity(), "base_sdk_jitlink_sha256": original,
             "patched_jitlink_sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),

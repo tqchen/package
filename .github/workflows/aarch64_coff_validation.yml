@@ -13,7 +13,7 @@ jobs:
       - uses: actions/checkout@v5
         with:
           repository: tqchen/tvm-ffi
-          ref: 3dc823a1017313123635806f69f02a5223334edf
+          ref: 80ba6181e83b84d19ce78f1d99cafc6a7ef03a6f
           path: consumer
           submodules: recursive
       - uses: actions/setup-python@v5
@@ -29,6 +29,9 @@ jobs:
           python -m pip install uv cmake ninja scikit-build-core pytest pytest-xdist "apache-tvm-ffi==0.1.15.post1" "mlc-llvm-static==23.1.1.post0"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           clang-cl --version
+      - name: Verify patch and source-cache handling
+        shell: pwsh
+        run: python -m pytest packages/mlc-llvm-static/tests/python/test_patches.py packages/mlc-llvm-static/tests/python/test_cache.py packages/mlc-llvm-static/tests/python/test_sources.py -q
       - name: Build patched LLVM JITLink and check relocations
         shell: pwsh
         run: python validation/native_coff.py
