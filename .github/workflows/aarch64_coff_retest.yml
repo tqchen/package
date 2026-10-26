@@ -42,7 +42,7 @@ jobs:
           uv build --wheel --no-build-isolation --out-dir wheelhouse consumer/addons/tvm_ffi_orcjit
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $wheel = (Get-ChildItem wheelhouse/*.whl)[0].FullName
-          uv pip install --python python --no-deps "$wheel"
+          uv pip install --system --python python --no-deps "$wheel"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -m pip check
       - name: Execute generated functions and lifecycle tests
