@@ -11,10 +11,11 @@ import split_sdk
 recipe = [{name: {key: spec[key] for key in ("version", "sha256")}
            for name, spec in prepare_llvm.SOURCES.items()}, prepare_llvm.DEFAULT_TARGETS]
 for module, names in (
-    (prepare_llvm, ("configure", "install", "build_dependencies", "build_llvm")),
+    (prepare_llvm, ("configure", "install", "build_dependencies", "build_llvm", "apply_llvm_patches", "llvm_patches", "patch_identity", "source_identity", "source_tree")),
     (split_sdk, ("read_components", "closure", "partitions", "cmake_value", "distribution_options", "record_build")),
 ):
     recipe.extend(inspect.getsource(getattr(module, name)) for name in names)
+recipe.append(prepare_llvm.patch_identity())
 recipe.append((Path(prepare_llvm.__file__).parent / "sdk_build_options.cmake").read_text())
 compilers = {name: os.environ[name] for name in ("CC", "CXX") if os.environ.get(name)}
 if compilers:

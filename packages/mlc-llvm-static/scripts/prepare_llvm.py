@@ -59,6 +59,37 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def llvm_patches() -> list[Path]:
+    return sorted((PROJECT_ROOT / "patches" / LLVM_VERSION).glob("*.patch"))
+
+
+def patch_identity() -> list[tuple[str, str]]:
+    return [(patch.name, sha256(patch)) for patch in llvm_patches()]
+
+
+def apply_llvm_patches(source: Path) -> None:
+    """Apply the pinned backend patches, accepting only exact already-applied patches."""
+    # Work on source archives independently of any enclosing package checkout.
+    env = {**os.environ, "GIT_CEILING_DIRECTORIES": str(source.resolve().parent)}
+    for patch in llvm_patches():
+        command = ["git", "-C", str(source), "apply"]
+        applied = subprocess.run(command + ["--reverse", "--check", str(patch)],
+                                 env=env, capture_output=True)
+        if applied.returncode == 0:
+            continue
+        check = subprocess.run(command + ["--check", str(patch)], env=env,
+                               capture_output=True, text=True)
+        if check.returncode:
+            raise RuntimeError(f"LLVM patch {patch.name} does not match the source tree: {check.stderr}")
+        subprocess.run(command + [str(patch)], env=env, check=True)
+
+
+def source_identity(name: str) -> str:
+    if name != "llvm":
+        return SOURCES[name]["sha256"]
+    return hashlib.sha256(json.dumps([SOURCES[name]["sha256"], patch_identity()]).encode()).hexdigest()
+
+
 def source_tree(name: str, work: Path) -> Path:
     override = os.environ.get(f"MLC_LLVM_STATIC_{name.upper()}_SOURCE_DIR")
     if override:
@@ -66,6 +97,8 @@ def source_tree(name: str, work: Path) -> Path:
         cmake_file = {"llvm": "llvm/CMakeLists.txt", "zstd": "build/cmake/CMakeLists.txt"}.get(name, "CMakeLists.txt")
         if not (path / cmake_file).is_file():
             raise RuntimeError(f"Invalid {name} source tree: {path}")
+        if name == "llvm":
+            apply_llvm_patches(path)
         return path
     spec = SOURCES[name]
     cache = Path(os.environ.get("MLC_LLVM_STATIC_SOURCE_CACHE", str(work / "sources"))).resolve()
@@ -91,7 +124,7 @@ def source_tree(name: str, work: Path) -> Path:
             raise RuntimeError(f"Could not fetch verified source {filename}: " + "; ".join(errors))
     destination = work / "sources" / name
     stamp = destination / ".mlc-source-sha256"
-    if stamp.is_file() and stamp.read_text() == spec["sha256"]:
+    if stamp.is_file() and stamp.read_text() == source_identity(name):
         return destination
     temporary = work / "sources" / f"extract-{name}"
     if temporary.exists():
@@ -105,11 +138,13 @@ def source_tree(name: str, work: Path) -> Path:
     roots = list(temporary.iterdir())
     if len(roots) != 1 or not roots[0].is_dir():
         raise RuntimeError(f"Expected one source directory in {archive}")
+    if name == "llvm":
+        apply_llvm_patches(roots[0])
     if destination.exists():
         shutil.rmtree(destination)
     roots[0].replace(destination)
     temporary.rmdir()
-    stamp.write_text(spec["sha256"])
+    stamp.write_text(source_identity(name))
     return destination
 
 

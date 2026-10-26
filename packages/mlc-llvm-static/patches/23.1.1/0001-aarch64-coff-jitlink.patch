@@ -1,0 +1,510 @@
+diff --git a/llvm/include/llvm/ExecutionEngine/JITLink/COFF_aarch64.h b/llvm/include/llvm/ExecutionEngine/JITLink/COFF_aarch64.h
+new file mode 100644
+index 0000000..a65da7a
+--- /dev/null
++++ b/llvm/include/llvm/ExecutionEngine/JITLink/COFF_aarch64.h
+@@ -0,0 +1,22 @@
++//===------ COFF_aarch64.h - JIT link functions for COFF/AArch64 ----*- C++
++//-*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++#ifndef LLVM_EXECUTIONENGINE_JITLINK_COFF_AARCH64_H
++#define LLVM_EXECUTIONENGINE_JITLINK_COFF_AARCH64_H
++#include "llvm/ExecutionEngine/JITLink/JITLink.h"
++namespace llvm::jitlink {
++/// Build a graph from a COFF/AArch64 relocatable object. The buffer must
++/// outlive the graph, which neither owns nor copies the underlying object
++/// contents.
++LLVM_ABI Expected<std::unique_ptr<LinkGraph>>
++createLinkGraphFromCOFFObject_aarch64(
++    MemoryBufferRef Buffer, std::shared_ptr<orc::SymbolStringPool> SSP);
++LLVM_ABI void link_COFF_aarch64(std::unique_ptr<LinkGraph> G,
++                                std::unique_ptr<JITLinkContext> Ctx);
++} // namespace llvm::jitlink
++#endif
+diff --git a/llvm/include/llvm/ExecutionEngine/JITLink/aarch64.h b/llvm/include/llvm/ExecutionEngine/JITLink/aarch64.h
+index 12bcdd1..ae2165d 100644
+--- a/llvm/include/llvm/ExecutionEngine/JITLink/aarch64.h
++++ b/llvm/include/llvm/ExecutionEngine/JITLink/aarch64.h
+@@ -415,6 +415,9 @@ enum EdgeKind_aarch64 : Edge::Kind {
+   ///     phase will result in an assert/unreachable during the fixup phase.
+   ///
+   RequestTLSDescEntryAndTransformToPageOffset12,
++
++  /// First architecture-specific edge kind available to object formats.
++  FirstPlatformRelocation,
+ };
+ 
+ /// Returns a string name for the given aarch64 edge. For debugging purposes
+diff --git a/llvm/lib/ExecutionEngine/JITLink/CMakeLists.txt b/llvm/lib/ExecutionEngine/JITLink/CMakeLists.txt
+index 0109002..69e157e 100644
+--- a/llvm/lib/ExecutionEngine/JITLink/CMakeLists.txt
++++ b/llvm/lib/ExecutionEngine/JITLink/CMakeLists.txt
+@@ -35,6 +35,7 @@ add_llvm_component_library(LLVMJITLink
+   COFF.cpp
+   COFFDirectiveParser.cpp
+   COFFLinkGraphBuilder.cpp
++  COFF_aarch64.cpp
+   COFF_x86_64.cpp
+ 
+   # XCOFF
+diff --git a/llvm/lib/ExecutionEngine/JITLink/COFF.cpp b/llvm/lib/ExecutionEngine/JITLink/COFF.cpp
+index 7e9bd0f..77eceb4 100644
+--- a/llvm/lib/ExecutionEngine/JITLink/COFF.cpp
++++ b/llvm/lib/ExecutionEngine/JITLink/COFF.cpp
+@@ -14,6 +14,7 @@
+ 
+ #include "llvm/BinaryFormat/COFF.h"
+ #include "llvm/ExecutionEngine/JITLink/COFF_x86_64.h"
++#include "llvm/ExecutionEngine/JITLink/COFF_aarch64.h"
+ #include "llvm/Object/COFF.h"
+ #include <cstring>
+ 
+@@ -108,6 +109,8 @@ createLinkGraphFromCOFFObject(MemoryBufferRef ObjectBuffer,
+   });
+ 
+   switch (Machine) {
++  case COFF::IMAGE_FILE_MACHINE_ARM64:
++    return createLinkGraphFromCOFFObject_aarch64(ObjectBuffer, std::move(SSP));
+   case COFF::IMAGE_FILE_MACHINE_AMD64:
+     return createLinkGraphFromCOFFObject_x86_64(ObjectBuffer, std::move(SSP));
+   default:
+@@ -120,6 +123,9 @@ createLinkGraphFromCOFFObject(MemoryBufferRef ObjectBuffer,
+ void link_COFF(std::unique_ptr<LinkGraph> G,
+                std::unique_ptr<JITLinkContext> Ctx) {
+   switch (G->getTargetTriple().getArch()) {
++  case Triple::aarch64:
++    link_COFF_aarch64(std::move(G), std::move(Ctx));
++    return;
+   case Triple::x86_64:
+     link_COFF_x86_64(std::move(G), std::move(Ctx));
+     return;
+diff --git a/llvm/lib/ExecutionEngine/JITLink/COFF_aarch64.cpp b/llvm/lib/ExecutionEngine/JITLink/COFF_aarch64.cpp
+new file mode 100644
+index 0000000..7f2441c
+--- /dev/null
++++ b/llvm/lib/ExecutionEngine/JITLink/COFF_aarch64.cpp
+@@ -0,0 +1,347 @@
++//===------ COFF_aarch64.cpp - JIT linker for COFF/AArch64
++//-------------------===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#include "llvm/ExecutionEngine/JITLink/COFF_aarch64.h"
++#include "COFFLinkGraphBuilder.h"
++#include "JITLinkGeneric.h"
++#include "SEHFrameSupport.h"
++#include "llvm/ExecutionEngine/JITLink/COFF.h"
++#include "llvm/ExecutionEngine/JITLink/aarch64.h"
++#include "llvm/Support/Endian.h"
++
++#define DEBUG_TYPE "jitlink"
++
++using namespace llvm;
++using namespace llvm::jitlink;
++
++namespace {
++enum EdgeKind_coff_aarch64 : Edge::Kind {
++  Pointer32NB = aarch64::FirstPlatformRelocation,
++  SectionIdx16,
++  SecRel32,
++  SecRelLow12A,
++  SecRelHigh12A,
++  SecRelLow12L,
++};
++
++const char *getEdgeKindName(Edge::Kind K) {
++  switch (K) {
++  case Pointer32NB:
++    return "Pointer32NB";
++  case SectionIdx16:
++    return "SectionIdx16";
++  case SecRel32:
++    return "SecRel32";
++  case SecRelLow12A:
++    return "SecRelLow12A";
++  case SecRelHigh12A:
++    return "SecRelHigh12A";
++  case SecRelLow12L:
++    return "SecRelLow12L";
++  default:
++    return aarch64::getEdgeKindName(K);
++  }
++}
++
++class COFFLinkGraphBuilder_aarch64 : public COFFLinkGraphBuilder {
++  Error addRelocations() override {
++    for (const auto &S : sections())
++      if (auto Err = forEachRelocation(
++              S, this, &COFFLinkGraphBuilder_aarch64::addRelocation))
++        return Err;
++    return Error::success();
++  }
++
++  Error addRelocation(const object::RelocationRef &R,
++                      const object::SectionRef &S, Block &B) {
++    using namespace support::endian;
++    if (R.getType() == COFF::IMAGE_REL_ARM64_ABSOLUTE)
++      return Error::success();
++    auto SI = R.getSymbol();
++    if (SI == getObject().symbol_end())
++      return make_error<JITLinkError>(
++          "Invalid symbol in AArch64 COFF relocation");
++    auto CS = getObject().getCOFFSymbol(*SI);
++    auto *Target = getGraphSymbol(getObject().getSymbolIndex(CS));
++    if (!Target)
++      return make_error<JITLinkError>("Missing AArch64 COFF relocation target");
++    uint64_t Offset =
++        S.getAddress() + R.getOffset() - B.getAddress().getValue();
++    unsigned Width = R.getType() == COFF::IMAGE_REL_ARM64_ADDR64    ? 8
++                     : R.getType() == COFF::IMAGE_REL_ARM64_SECTION ? 2
++                                                                    : 4;
++    if (Offset > B.getSize() || B.getSize() - Offset < Width)
++      return make_error<JITLinkError>(
++          "AArch64 COFF relocation exceeds its block");
++    if (B.isZeroFill())
++      return make_error<JITLinkError>(
++          "AArch64 COFF relocation in zero-fill block");
++    const char *P = B.getContent().data() + Offset;
++    uint32_t Instr = Width == 4 ? read32le(P) : 0;
++    uint32_t ClearMask = 0;
++    Edge::Kind K = Edge::Invalid;
++    int64_t A = 0;
++    switch (R.getType()) {
++    case COFF::IMAGE_REL_ARM64_ADDR64:
++      K = aarch64::Pointer64;
++      A = read64le(P);
++      break;
++    case COFF::IMAGE_REL_ARM64_ADDR32:
++      K = aarch64::Pointer32;
++      A = int32_t(read32le(P));
++      break;
++    case COFF::IMAGE_REL_ARM64_ADDR32NB:
++      K = Pointer32NB;
++      A = int32_t(read32le(P));
++      if (!GetImageBaseSymbol()(getGraph()))
++        addImageBaseSymbol();
++      break;
++    case COFF::IMAGE_REL_ARM64_REL32:
++      K = aarch64::Delta32;
++      A = int64_t(int32_t(read32le(P))) - 4;
++      break;
++    case COFF::IMAGE_REL_ARM64_REL21:
++    case COFF::IMAGE_REL_ARM64_PAGEBASE_REL21:
++      K = R.getType() == COFF::IMAGE_REL_ARM64_REL21 ? aarch64::ADRLiteral21
++                                                     : aarch64::Page21;
++      if ((Instr & 0x9f000000) !=
++          (K == aarch64::Page21 ? 0x90000000 : 0x10000000))
++        return make_error<JITLinkError>(
++            "Invalid ADR/ADRP relocation instruction");
++      // COFF stores a signed byte addend, including in an ADRP instruction.
++      // Page rounding applies to S+A, not separately to S and A.
++      A = SignExtend64<21>(((Instr >> 29) & 3) | ((Instr >> 3) & 0x1ffffc));
++      ClearMask = 0x60ffffe0;
++      break;
++    case COFF::IMAGE_REL_ARM64_PAGEOFFSET_12A:
++    case COFF::IMAGE_REL_ARM64_SECREL_LOW12A:
++    case COFF::IMAGE_REL_ARM64_SECREL_HIGH12A:
++      if ((Instr & 0x7f000000) != 0x11000000)
++        return make_error<JITLinkError>("Invalid ADD relocation instruction");
++      K = R.getType() == COFF::IMAGE_REL_ARM64_PAGEOFFSET_12A
++              ? aarch64::PageOffset12
++          : R.getType() == COFF::IMAGE_REL_ARM64_SECREL_LOW12A ? SecRelLow12A
++                                                               : SecRelHigh12A;
++      A = (Instr >> 10) & 0xfff;
++      ClearMask = 0x003ffc00;
++      break;
++    case COFF::IMAGE_REL_ARM64_PAGEOFFSET_12L:
++    case COFF::IMAGE_REL_ARM64_SECREL_LOW12L:
++      if (!aarch64::isLoadStoreImm12(Instr))
++        return make_error<JITLinkError>(
++            "Invalid load/store relocation instruction");
++      K = R.getType() == COFF::IMAGE_REL_ARM64_PAGEOFFSET_12L
++              ? aarch64::PageOffset12
++              : SecRelLow12L;
++      A = ((Instr >> 10) & 0xfff) << aarch64::getPageOffset12Shift(Instr);
++      ClearMask = 0x003ffc00;
++      break;
++    case COFF::IMAGE_REL_ARM64_BRANCH26:
++      if ((Instr & 0x7c000000) != 0x14000000)
++        return make_error<JITLinkError>("Invalid B/BL relocation instruction");
++      K = aarch64::Branch26PCRel;
++      A = SignExtend64<28>((Instr & 0x03ffffff) << 2);
++      ClearMask = 0x03ffffff;
++      break;
++    case COFF::IMAGE_REL_ARM64_BRANCH19:
++      if (!aarch64::isCondBranchImm19(Instr) &&
++          !aarch64::isCompAndBranchImm19(Instr))
++        return make_error<JITLinkError>(
++            "Invalid conditional branch relocation instruction");
++      K = aarch64::CondBranch19PCRel;
++      A = SignExtend64<21>(((Instr >> 5) & 0x7ffff) << 2);
++      ClearMask = 0x00ffffe0;
++      break;
++    case COFF::IMAGE_REL_ARM64_BRANCH14:
++      if (!aarch64::isTestAndBranchImm14(Instr))
++        return make_error<JITLinkError>(
++            "Invalid test branch relocation instruction");
++      K = aarch64::TestAndBranch14PCRel;
++      A = SignExtend64<16>(((Instr >> 5) & 0x3fff) << 2);
++      ClearMask = 0x0007ffe0;
++      break;
++    case COFF::IMAGE_REL_ARM64_SECTION:
++      K = SectionIdx16;
++      A = int16_t(read16le(P));
++      if (CS.isUndefined())
++        return make_error<JITLinkError>(
++            "SECTION relocation requires a defined target");
++      Target = &getGraph().addAbsoluteSymbol(
++          "secidx",
++          orc::ExecutorAddr(CS.isAbsolute()
++                                ? getObject().getNumberOfSections() + 1
++                                : CS.getSectionNumber()),
++          2, Linkage::Strong, Scope::Local, false);
++      break;
++    case COFF::IMAGE_REL_ARM64_SECREL:
++      K = SecRel32;
++      A = int32_t(read32le(P));
++      break;
++    default:
++      return make_error<JITLinkError>("Unsupported AArch64 COFF relocation: " +
++                                      Twine(R.getType()));
++    }
++    if (K >= SecRel32 && !Target->isDefined())
++      return make_error<JITLinkError>(
++          "Section-relative relocation requires a defined target");
++    if (ClearMask) {
++      if (Offset % 4)
++        return make_error<JITLinkError>(
++            "Unaligned AArch64 instruction relocation");
++      write32le(B.getMutableContent(getGraph()).data() + Offset,
++                Instr & ~ClearMask);
++    }
++    B.addEdge(K, Offset, *Target, A);
++    return Error::success();
++  }
++
++public:
++  COFFLinkGraphBuilder_aarch64(const object::COFFObjectFile &Obj,
++                               std::shared_ptr<orc::SymbolStringPool> SSP,
++                               Triple TT, SubtargetFeatures Features)
++      : COFFLinkGraphBuilder(Obj, std::move(SSP), std::move(TT),
++                             std::move(Features), getEdgeKindName) {}
++};
++
++// Named COFF imports are local pointer slots, so imported data and functions
++// both retain their real address and ADRP accesses stay near their use sites.
++Error buildTables(LinkGraph &G) {
++  SmallVector<Symbol *, 8> Imports;
++  for (auto *S : G.external_symbols())
++    if ((*S->getName()).starts_with("__imp_"))
++      Imports.push_back(S);
++  if (!Imports.empty()) {
++    auto &IAT = G.createSection("$__IAT", orc::MemProt::Read);
++    for (auto *S : Imports) {
++      auto Name = G.intern((*S->getName()).drop_front(6));
++      auto *Target = G.findExternalSymbolByName(Name);
++      if (!Target)
++        Target = G.findDefinedSymbolByName(Name);
++      if (!Target)
++        Target = G.findAbsoluteSymbolByName(Name);
++      if (!Target)
++        Target = &G.addExternalSymbol(Name, 0, false);
++      auto &Slot = aarch64::createAnonymousPointer(G, IAT, Target);
++      G.makeDefined(*S, Slot.getBlock(), 0, 8, Linkage::Strong, Scope::Local,
++                    true);
++    }
++  }
++  SmallVector<Edge *, 16> Branches;
++  for (auto *B : G.blocks())
++    for (auto &E : B->edges())
++      if (E.getKind() == aarch64::Branch26PCRel && !E.getTarget().isDefined())
++        Branches.push_back(&E);
++  if (!Branches.empty()) {
++    auto &Pointers = G.createSection("$__GOT", orc::MemProt::Read);
++    auto &Stubs =
++        G.createSection("$__STUBS", orc::MemProt::Read | orc::MemProt::Exec);
++    DenseMap<std::pair<Symbol *, int64_t>, Symbol *> Entries;
++    for (auto *E : Branches) {
++      auto [I, Inserted] =
++          Entries.try_emplace({&E->getTarget(), E->getAddend()}, nullptr);
++      if (Inserted) {
++        auto &Pointer = aarch64::createAnonymousPointer(
++            G, Pointers, &E->getTarget(), E->getAddend());
++        I->second = &aarch64::createAnonymousPointerJumpStub(G, Stubs, Pointer);
++      }
++      E->setTarget(*I->second);
++      E->setAddend(0);
++    }
++  }
++  return Error::success();
++}
++
++class COFFJITLinker_aarch64 : public JITLinker<COFFJITLinker_aarch64> {
++  friend class JITLinker<COFFJITLinker_aarch64>;
++
++public:
++  using JITLinker::JITLinker;
++
++private:
++  Error applyFixup(LinkGraph &G, Block &B, const Edge &E) const {
++    using namespace support::endian;
++    if (E.getKind() < aarch64::FirstPlatformRelocation)
++      return aarch64::applyFixup(G, B, E, nullptr);
++    uint64_t Value = E.getTarget().getAddress().getValue() + E.getAddend();
++    char *P = B.getAlreadyMutableContent().data() + E.getOffset();
++    if (E.getKind() == SectionIdx16) {
++      if (!isUInt<16>(Value))
++        return makeTargetOutOfRangeError(G, B, E);
++      write16le(P, Value);
++      return Error::success();
++    }
++    if (E.getKind() == Pointer32NB) {
++      auto *Base = GetImageBaseSymbol()(G);
++      if (!Base)
++        return make_error<JITLinkError>("Missing __ImageBase symbol");
++      Value -= Base->getAddress().getValue();
++    } else {
++      if (!E.getTarget().isDefined())
++        return make_error<JITLinkError>(
++            "Section-relative relocation requires a defined target");
++      Value -= SectionRange(E.getTarget().getSection()).getStart().getValue();
++    }
++    if (E.getKind() == Pointer32NB || E.getKind() == SecRel32) {
++      if (!isUInt<32>(Value))
++        return makeTargetOutOfRangeError(G, B, E);
++      write32le(P, Value);
++    } else {
++      uint32_t Instr = read32le(P);
++      unsigned Shift = E.getKind() == SecRelLow12L
++                           ? aarch64::getPageOffset12Shift(Instr)
++                           : 0;
++      if (E.getKind() == SecRelHigh12A) {
++        Value >>= 12;
++        if (!isUInt<12>(Value))
++          return makeTargetOutOfRangeError(G, B, E);
++      } else {
++        Value &= 0xfff;
++        if (Value & ((1U << Shift) - 1))
++          return make_error<JITLinkError>(
++              "Unaligned section-relative load/store offset");
++        Value >>= Shift;
++      }
++      write32le(P, Instr | (Value << 10));
++    }
++    return Error::success();
++  }
++};
++} // namespace
++
++namespace llvm::jitlink {
++Expected<std::unique_ptr<LinkGraph>> createLinkGraphFromCOFFObject_aarch64(
++    MemoryBufferRef Buffer, std::shared_ptr<orc::SymbolStringPool> SSP) {
++  auto Obj = object::ObjectFile::createCOFFObjectFile(Buffer);
++  if (!Obj)
++    return Obj.takeError();
++  auto Features = (*Obj)->getFeatures();
++  if (!Features)
++    return Features.takeError();
++  return COFFLinkGraphBuilder_aarch64(
++             **Obj, std::move(SSP), (*Obj)->makeTriple(), std::move(*Features))
++      .buildGraph();
++}
++
++void link_COFF_aarch64(std::unique_ptr<LinkGraph> G,
++                       std::unique_ptr<JITLinkContext> Ctx) {
++  PassConfiguration Config;
++  if (Ctx->shouldAddDefaultTargetPasses(G->getTargetTriple())) {
++    if (auto MarkLive = Ctx->getMarkLivePass(G->getTargetTriple())) {
++      Config.PrePrunePasses.push_back(std::move(MarkLive));
++      Config.PrePrunePasses.push_back(SEHFrameKeepAlivePass(".pdata"));
++    } else {
++      Config.PrePrunePasses.push_back(markAllSymbolsLive);
++    }
++    Config.PostPrunePasses.push_back(buildTables);
++  }
++  if (auto Err = Ctx->modifyPassConfig(*G, Config))
++    return Ctx->notifyFailed(std::move(Err));
++  COFFJITLinker_aarch64::link(std::move(Ctx), std::move(G), std::move(Config));
++}
++} // namespace llvm::jitlink
+diff --git a/llvm/test/ExecutionEngine/JITLink/AArch64/COFF_relocations.s b/llvm/test/ExecutionEngine/JITLink/AArch64/COFF_relocations.s
+new file mode 100644
+index 0000000..43e3ed4
+--- /dev/null
++++ b/llvm/test/ExecutionEngine/JITLink/AArch64/COFF_relocations.s
+@@ -0,0 +1,66 @@
++# RUN: rm -rf %t && mkdir -p %t
++# RUN: llvm-mc -triple=aarch64-pc-windows-msvc -filetype=obj -o %t/coff_reloc.o %s
++# RUN: llvm-jitlink -noexec -slab-allocate 100Kb -slab-address 0x10000000 \
++# RUN:   -slab-page-size 4096 -abs __ImageBase=0x10000000 \
++# RUN:   -abs external_func=0x7000000000 -abs external_data=0x12345008 \
++# RUN:   -check %s %t/coff_reloc.o
++
++        .text
++        .globl main, page, page_negative, pageoff, load8, load128, address
++        .globl call_external, jump_external, import_page, import_load
++        .p2align 2
++main:
++        ret
++page:
++        adrp x0, data+4096
++# jitlink-check: decode_operand(page, 1) = ((data+4096)[63:12] - page[63:12])[20:0]
++page_negative:
++        adrp x0, data-16
++# jitlink-check: decode_operand(page_negative, 1)[20:0] = ((data-16)[63:12] - page_negative[63:12])[20:0]
++pageoff:
++        add x0, x0, :lo12:data+8
++# jitlink-check: decode_operand(pageoff, 2) = (data+8)[11:0]
++load8:
++        ldr x0, [x0, :lo12:data+8]
++# jitlink-check: decode_operand(load8, 2) = (data+8)[11:3]
++load128:
++        ldr q0, [x0, :lo12:data+16]
++# jitlink-check: decode_operand(load128, 2) = (data+16)[11:4]
++address:
++        adr x0, data-4
++# jitlink-check: decode_operand(address, 1)[20:0] = (data-4-address)[20:0]
++call_external:
++        bl external_func
++jump_external:
++        b external_func
++# jitlink-check: decode_operand(call_external, 0) = (stub_addr(coff_reloc.o, external_func)-call_external)[27:2]
++# jitlink-check: decode_operand(jump_external, 0) = (stub_addr(coff_reloc.o, external_func)-jump_external)[27:2]
++# jitlink-check: *{8}(got_addr(coff_reloc.o, external_func)) = external_func
++import_page:
++        adrp x0, __imp_external_data
++import_load:
++        ldr x0, [x0, :lo12:__imp_external_data]
++# jitlink-check: *{8}(__imp_external_data) = external_data
++# jitlink-check: decode_operand(import_load, 2) = __imp_external_data[11:3]
++
++        .data
++        .p2align 4
++        .quad 0, 0
++        .globl data, ptr64, ptr32, rva, secrel, secidx
++ data:
++        .quad 42, 43
++ptr64:
++        .quad data-8
++ptr32:
++        .long external_data-4
++rva:
++        .rva data-4
++secrel:
++        .secrel32 data
++secidx:
++        .secidx data
++# jitlink-check: *{8}(ptr64) = data-8
++# jitlink-check: *{4}(ptr32) = external_data-4
++# jitlink-check: *{4}(rva) = data-__ImageBase-4
++# jitlink-check: *{4}(secrel) = 16
++# jitlink-check: *{2}(secidx) = 2

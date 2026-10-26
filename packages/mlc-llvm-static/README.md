@@ -298,3 +298,18 @@ Then run `python scripts/stamp_version.py` to update the exact-version
 requirements between `mlc-llvm-static` and `mlc-llvm-static-extra-targets` in
 both `pyproject.toml` files. The build generates the runtime
 `mlc_llvm_static/_version.py` from `version.py`; it is not checked in.
+
+### LLVM source patches
+
+The source recipe applies the versioned patches in `patches/<LLVM_VERSION>`
+with `git apply` before compiling LLVM. Their contents are included in both the
+source-tree stamp and compiled-SDK cache key. A source override must accept the
+patches or already contain them exactly; incompatible local edits cause an error.
+Prebuilt SDK prefixes supplied by the caller are not modified.
+
+The LLVM 23.1.1 patch adds AArch64 COFF JITLink graph construction and linking,
+including graph-local import slots and external B/BL thunks. Conditional
+branches, graph-defined branches, and direct ADR/ADRP references remain subject
+to the architecture's displacement limits. This backend does not by itself
+register Windows unwind tables or provide a COFF CRT runtime; those remain the
+embedding application's responsibility.
